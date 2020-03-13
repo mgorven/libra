@@ -93,7 +93,11 @@ fn main() {
         .config_files
         .iter()
         .map(|config| {
-            let port = NodeConfig::load(config).unwrap().rpc.address.port();
+            let port = NodeConfig::load(config)
+                .unwrap()
+                .admission_control
+                .address
+                .port();
             format!("localhost:{}", port)
         })
         .collect::<Vec<String>>()

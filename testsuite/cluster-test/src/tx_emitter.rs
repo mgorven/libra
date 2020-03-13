@@ -4,24 +4,34 @@
 #![forbid(unsafe_code)]
 
 use crate::{cluster::Cluster, instance::Instance};
+use admission_control_proto::proto::{
+    admission_control::SubmitTransactionRequest, AdmissionControlClientAsync,
+};
 use std::{
+    convert::TryFrom,
     slice,
     sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{format_err, Result};
+use admission_control_proto::{AdmissionControlStatus, SubmitTransactionResponse};
+use anyhow::{bail, format_err, Result};
 use itertools::zip;
 use libra_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
     test_utils::KeyPair,
     traits::Uniform,
 };
-use libra_logger::*;
+use libra_logger::{debug, info};
 use libra_types::{
     account_address::{AccountAddress, AuthenticationKey},
-    account_config::association_address,
+    account_config::{association_address, AccountResource},
+    get_with_proof::ResponseItem,
+    proto::types::{
+        request_item::RequestedItems, GetAccountStateRequest, RequestItem,
+        UpdateToLatestLedgerRequest,
+    },
     transaction::{helpers::create_user_txn, Script, TransactionPayload},
 };
 use rand::{
@@ -33,11 +43,10 @@ use rand::{
 use tokio::runtime::{Handle, Runtime};
 
 use futures::{executor::block_on, future::FutureExt};
-use libra_json_rpc::JsonRpcAsyncClient;
-use libra_types::transaction::SignedTransaction;
-use reqwest::Client;
 use std::{
     cmp::{max, min},
+    fmt,
+    ops::{Deref, DerefMut},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::{task::JoinHandle, time};
@@ -48,7 +57,6 @@ const MAX_TXN_BATCH_SIZE: usize = 100; // Max transactions per account in mempoo
 pub struct TxEmitter {
     accounts: Vec<AccountData>,
     mint_key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
-    http_client: Client,
 }
 
 pub struct EmitJob {
@@ -112,7 +120,6 @@ impl TxEmitter {
         Self {
             accounts: vec![],
             mint_key_pair: cluster.mint_key_pair().clone(),
-            http_client: Client::new(),
         }
     }
 
@@ -120,12 +127,12 @@ impl TxEmitter {
         self.accounts.clear();
     }
 
-    fn pick_mint_client(&self, instances: &[Instance]) -> JsonRpcAsyncClient {
+    fn pick_mint_client(instances: &[Instance]) -> NamedAdmissionControlClient {
         let mut rng = ThreadRng::default();
         let mint_instance = instances
             .choose(&mut rng)
             .expect("Instances can not be empty");
-        self.make_client(mint_instance)
+        NamedAdmissionControlClient(mint_instance.clone(), Self::make_client(mint_instance))
     }
 
     pub async fn start_job(&mut self, req: EmitJobRequest) -> Result<EmitJob> {
@@ -161,7 +168,8 @@ impl TxEmitter {
         let tokio_handle = Handle::current();
         for instance in &req.instances {
             for _ in 0..workers_per_ac {
-                let client = self.make_client(&instance);
+                let client =
+                    NamedAdmissionControlClient(instance.clone(), Self::make_client(&instance));
                 let accounts = (&mut all_accounts).take(req.accounts_per_client).collect();
                 let all_addresses = all_addresses.clone();
                 let stop = stop.clone();
@@ -192,7 +200,7 @@ impl TxEmitter {
             return Ok(()); // Early return to skip printing 'Minting ...' logs
         }
         let mut faucet_account = load_faucet_account(
-            &mut self.pick_mint_client(&req.instances),
+            &mut Self::pick_mint_client(&req.instances),
             self.mint_key_pair.clone(),
         )
         .await?;
@@ -205,7 +213,7 @@ impl TxEmitter {
             LIBRA_PER_NEW_ACCOUNT * num_accounts as u64,
         );
         execute_and_wait_transactions(
-            &mut self.pick_mint_client(&req.instances),
+            &mut Self::pick_mint_client(&req.instances),
             &mut faucet_account,
             vec![mint_txn],
         )
@@ -218,7 +226,7 @@ impl TxEmitter {
             req.instances.len(),
             libra_per_seed,
             100,
-            self.pick_mint_client(&req.instances),
+            Self::pick_mint_client(&req.instances),
         )
         .await
         .map_err(|e| format_err!("Failed to mint seed_accounts: {}", e))?;
@@ -231,9 +239,10 @@ impl TxEmitter {
                 // Spawn new threads
                 let instance = req.instances[i].clone();
                 let num_new_accounts = num_accounts / req.instances.len();
-                let client = self.make_client(&instance);
                 thread::spawn(move || {
                     let mut rt = Runtime::new().unwrap();
+                    let client =
+                        NamedAdmissionControlClient(instance.clone(), Self::make_client(&instance));
                     rt.block_on(create_new_accounts(
                         &mut seed_account,
                         num_new_accounts,
@@ -273,12 +282,8 @@ impl TxEmitter {
         }
     }
 
-    fn make_client(&self, instance: &Instance) -> JsonRpcAsyncClient {
-        JsonRpcAsyncClient::new(
-            self.http_client.clone(),
-            instance.ip(),
-            instance.ac_port() as u16,
-        )
+    fn make_client(instance: &Instance) -> AdmissionControlClientAsync {
+        AdmissionControlClientAsync::new(instance.ip(), instance.ac_port() as u16)
     }
 
     pub async fn emit_txn_for(
@@ -299,7 +304,7 @@ struct Worker {
 
 struct SubmissionWorker {
     accounts: Vec<AccountData>,
-    client: JsonRpcAsyncClient,
+    client: NamedAdmissionControlClient,
     all_addresses: Arc<Vec<AccountAddress>>,
     stop: Arc<AtomicBool>,
     params: EmitThreadParams,
@@ -317,8 +322,17 @@ impl SubmissionWorker {
                 self.stats.submitted.fetch_add(1, Ordering::Relaxed);
                 let wait_util = Instant::now() + wait;
                 let resp = self.client.submit_transaction(request).await;
-                if let Err(e) = resp {
-                    warn!("[{:?}] Failed to submit request: {:?}", self.client, e);
+                match resp {
+                    Err(e) => {
+                        info!("[{}] Failed to submit request: {:?}", self.client.0, e);
+                    }
+                    Ok(r) => {
+                        let r = SubmitTransactionResponse::try_from(r)
+                            .expect("Failed to parse SubmitTransactionResponse");
+                        if !is_accepted(&r) {
+                            info!("[{}] Request declined: {:?}", self.client.0, r);
+                        }
+                    }
                 }
                 let now = Instant::now();
                 if wait_util > now {
@@ -327,7 +341,7 @@ impl SubmissionWorker {
             }
             if self.params.wait_committed {
                 if let Err(uncommitted) =
-                    wait_for_accounts_sequence(&self.client, &mut self.accounts).await
+                    wait_for_accounts_sequence(&mut self.client, &mut self.accounts).await
                 {
                     self.stats
                         .committed
@@ -336,8 +350,8 @@ impl SubmissionWorker {
                         .expired
                         .fetch_add(uncommitted.len() as u64, Ordering::Relaxed);
                     info!(
-                        "[{:?}] Transactions were not committed before expiration: {:?}",
-                        self.client, uncommitted
+                        "[{}] Transactions were not committed before expiration: {:?}",
+                        self.client.0, uncommitted
                     );
                 } else {
                     self.stats
@@ -349,7 +363,7 @@ impl SubmissionWorker {
         self.accounts
     }
 
-    fn gen_requests(&mut self) -> Vec<SignedTransaction> {
+    fn gen_requests(&mut self) -> Vec<SubmitTransactionRequest> {
         let mut rng = ThreadRng::default();
         let batch_size = max(MAX_TXN_BATCH_SIZE, self.accounts.len());
         let accounts = self
@@ -370,7 +384,7 @@ impl SubmissionWorker {
 }
 
 async fn wait_for_accounts_sequence(
-    client: &JsonRpcAsyncClient,
+    client: &mut NamedAdmissionControlClient,
     accounts: &mut [AccountData],
 ) -> Result<(), Vec<(AccountAddress, u64)>> {
     let deadline = Instant::now() + TXN_MAX_WAIT;
@@ -378,8 +392,8 @@ async fn wait_for_accounts_sequence(
     loop {
         match query_sequence_numbers(client, &addresses).await {
             Err(e) => info!(
-                "Failed to query ledger info for instance {:?} : {:?}",
-                client, e
+                "Failed to query ledger info for instance {} : {:?}",
+                client.0, e
             ),
             Ok(sequence_numbers) => {
                 if is_sequence_equal(accounts, &sequence_numbers) {
@@ -412,18 +426,47 @@ fn is_sequence_equal(accounts: &[AccountData], sequence_numbers: &[u64]) -> bool
 }
 
 async fn query_sequence_numbers(
-    client: &JsonRpcAsyncClient,
+    client: &mut AdmissionControlClientAsync,
     addresses: &[AccountAddress],
 ) -> Result<Vec<u64>> {
     let mut result = vec![];
-    for addresses_batch in addresses.chunks(20) {
+    for addresses_batch in addresses.chunks(MAX_TXN_BATCH_SIZE) {
+        let mut update_request = UpdateToLatestLedgerRequest::default();
+        for address in addresses_batch {
+            let mut request_item = RequestItem::default();
+            let mut account_state_request = GetAccountStateRequest::default();
+            account_state_request.address = address.to_vec();
+            request_item.requested_items = Some(RequestedItems::GetAccountStateRequest(
+                account_state_request,
+            ));
+            update_request.requested_items.push(request_item);
+        }
         let resp = client
-            .get_accounts_state(addresses_batch)
+            .update_to_latest_ledger(update_request)
             .await
-            .map_err(|e| format_err!("[{:?}] get_accounts_state failed: {:?} ", client, e))?;
+            .map_err(|e| format_err!("update_to_latest_ledger failed: {:?} ", e))?;
 
-        for item in resp.into_iter() {
-            result.push(item.sequence_number);
+        for item in resp.response_items.into_iter() {
+            let item = ResponseItem::try_from(item)
+                .map_err(|e| format_err!("ResponseItem::from_proto failed: {:?} ", e))?;
+            if let ResponseItem::GetAccountState {
+                account_state_with_proof,
+            } = item
+            {
+                let sequence_number = if let Some(blob) = account_state_with_proof.blob {
+                    let account_resource = AccountResource::try_from(&blob)
+                        .map_err(|e| format_err!("AccountResource::try_from failed: {:?} ", e))?;
+                    account_resource.sequence_number()
+                } else {
+                    0
+                };
+                result.push(sequence_number);
+            } else {
+                bail!(
+                    "Unexpected item in UpdateToLatestLedgerResponse: {:?}",
+                    item
+                );
+            }
         }
     }
     Ok(result)
@@ -438,7 +481,7 @@ const LIBRA_PER_NEW_ACCOUNT: u64 = 1_000_000;
 fn gen_submit_transaction_request(
     script: Script,
     sender_account: &mut AccountData,
-) -> SignedTransaction {
+) -> SubmitTransactionRequest {
     let transaction = create_user_txn(
         &sender_account.key_pair,
         TransactionPayload::Script(script),
@@ -449,8 +492,10 @@ fn gen_submit_transaction_request(
         TXN_EXPIRATION_SECONDS,
     )
     .expect("Failed to create signed transaction");
+    let mut req = SubmitTransactionRequest::default();
+    req.transaction = Some(transaction.into());
     sender_account.sequence_number += 1;
-    transaction
+    req
 }
 
 fn gen_mint_request(
@@ -458,7 +503,7 @@ fn gen_mint_request(
     receiver: &AccountAddress,
     receiver_auth_key_prefix: Vec<u8>,
     num_coins: u64,
-) -> SignedTransaction {
+) -> SubmitTransactionRequest {
     gen_submit_transaction_request(
         transaction_builder::encode_mint_script(receiver, receiver_auth_key_prefix, num_coins),
         sender,
@@ -470,7 +515,7 @@ fn gen_transfer_txn_request(
     receiver: &AccountAddress,
     receiver_auth_key_prefix: Vec<u8>,
     num_coins: u64,
-) -> SignedTransaction {
+) -> SubmitTransactionRequest {
     gen_submit_transaction_request(
         transaction_builder::encode_transfer_script(receiver, receiver_auth_key_prefix, num_coins),
         sender,
@@ -498,7 +543,7 @@ fn gen_transfer_txn_requests(
     source_account: &mut AccountData,
     accounts: &[AccountData],
     amount: u64,
-) -> Vec<SignedTransaction> {
+) -> Vec<SubmitTransactionRequest> {
     accounts
         .iter()
         .map(|account| {
@@ -513,12 +558,12 @@ fn gen_transfer_txn_requests(
 }
 
 async fn execute_and_wait_transactions(
-    client: &mut JsonRpcAsyncClient,
+    client: &mut NamedAdmissionControlClient,
     account: &mut AccountData,
-    txn: Vec<SignedTransaction>,
+    txn: Vec<SubmitTransactionRequest>,
 ) -> Result<()> {
     debug!(
-        "[{:?}] Submitting transactions {} - {} for {}",
+        "[{}] Submitting transactions {} - {} for {}",
         client,
         account.sequence_number - txn.len() as u64,
         account.sequence_number,
@@ -527,11 +572,24 @@ async fn execute_and_wait_transactions(
     for request in txn {
         retry::retry_async(retry::fixed_retry_strategy(5_000, 20), || {
             let request = request.clone();
-            let c = client.clone();
-            let client_name = format!("{:?}", client);
+            let mut c = client.clone();
+            let client_name = client.to_string();
             Box::pin(async move {
                 let resp = c.submit_transaction(request).await;
-                resp.map_err(|e| format_err!("[{}] Failed to submit request: {:?}", client_name, e))
+                match resp {
+                    Err(e) => {
+                        bail!("[{}] Failed to submit request: {:?}", client_name, e);
+                    }
+                    Ok(r) => {
+                        let r = SubmitTransactionResponse::try_from(r)
+                            .expect("Failed to parse SubmitTransactionResponse");
+                        if !is_accepted(&r) {
+                            bail!("[{}] Request declined: {:?}", client_name, r);
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
             })
         })
         .await?;
@@ -540,14 +598,14 @@ async fn execute_and_wait_transactions(
         .await
         .map_err(|_| format_err!("Mint transactions were not committed before expiration"));
     debug!(
-        "[{:?}] Account {} is at sequence number {} now",
+        "[{}] Account {} is at sequence number {} now",
         client, account.address, account.sequence_number
     );
     r
 }
 
 async fn load_faucet_account(
-    client: &mut JsonRpcAsyncClient,
+    client: &mut NamedAdmissionControlClient,
     key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
 ) -> Result<AccountData> {
     let address = association_address();
@@ -555,7 +613,7 @@ async fn load_faucet_account(
         .await
         .map_err(|e| {
             format_err!(
-                "query_sequence_numbers on {:?} for faucet account failed: {}",
+                "query_sequence_numbers on {} for faucet account failed: {}",
                 client,
                 e
             )
@@ -574,7 +632,7 @@ async fn create_new_accounts(
     num_new_accounts: usize,
     libra_per_new_account: u64,
     max_num_accounts_per_batch: u64,
-    mut client: JsonRpcAsyncClient,
+    mut client: NamedAdmissionControlClient,
 ) -> Result<Vec<AccountData>> {
     let mut i = 0;
     let mut accounts = vec![];
@@ -603,5 +661,34 @@ impl AccountData {
         AuthenticationKey::from_public_key(&self.key_pair.public_key)
             .prefix()
             .to_vec()
+    }
+}
+
+fn is_accepted(resp: &SubmitTransactionResponse) -> bool {
+    if let Some(ref status) = resp.ac_status {
+        return *status == AdmissionControlStatus::Accepted;
+    }
+    false
+}
+
+struct NamedAdmissionControlClient(Instance, AdmissionControlClientAsync);
+
+impl fmt::Display for NamedAdmissionControlClient {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Deref for NamedAdmissionControlClient {
+    type Target = AdmissionControlClientAsync;
+
+    fn deref(&self) -> &Self::Target {
+        &self.1
+    }
+}
+
+impl DerefMut for NamedAdmissionControlClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.1
     }
 }
