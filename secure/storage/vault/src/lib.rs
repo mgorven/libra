@@ -187,7 +187,7 @@ impl Client {
     }
 
     /// Read a key/value pair from a given secret store.
-    pub fn read_secret(&self, secret: &str, key: &str) -> Result<ReadResponse<String>, Error> {
+    pub fn read_secret(&self, secret: &str) -> Result<ReadResponse<String>, Error> {
         let resp = ureq::get(&format!("{}/v1/secret/data/{}", self.host, secret))
             .set("X-Vault-Token", &self.token)
             .timeout_connect(TIMEOUT)
@@ -196,15 +196,11 @@ impl Client {
             200 => {
                 let mut resp: ReadSecretResponse = serde_json::from_str(&resp.into_string()?)?;
                 let data = &mut resp.data;
-                let value = data
-                    .data
-                    .remove(key)
-                    .ok_or_else(|| Error::NotFound(secret.into(), key.into()))?;
                 let created_time = data.metadata.created_time.clone();
                 let version = data.metadata.version;
-                Ok(ReadResponse::new(created_time, value, version))
+                Ok(ReadResponse::new(created_time, serde_json::to_string(&data.data)?, version))
             }
-            404 => Err(Error::NotFound(secret.into(), key.into())),
+            404 => Err(Error::NotFound("secret/".into(), secret.into())),
             _ => Err(resp.into()),
         }
     }
@@ -358,11 +354,11 @@ impl Client {
     }
 
     /// Create or update a key/value pair in a given secret store.
-    pub fn write_secret(&self, secret: &str, key: &str, value: &str) -> Result<(), Error> {
+    pub fn write_secret(&self, secret: &str, data: &str) -> Result<(), Error> {
         let resp = ureq::put(&format!("{}/v1/secret/data/{}", self.host, secret))
             .set("X-Vault-Token", &self.token)
             .timeout_connect(TIMEOUT)
-            .send_json(json!({ "data": { key: value } }));
+            .send_json(json!({ "data": serde_json::from_str(&data)? }));
         match resp.status() {
             200 => Ok(()),
             _ => Err(resp.into()),
