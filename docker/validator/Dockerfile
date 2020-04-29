@@ -12,9 +12,12 @@ WORKDIR /libra
 COPY rust-toolchain /libra/rust-toolchain
 RUN rustup install $(cat rust-toolchain)
 
-FROM toolchain AS builder
+FROM toolchain as crate_cache
 
 COPY . /libra
+RUN cargo fetch
+
+FROM crate_cache AS builder
 
 RUN cargo build --release -p libra-node -p cli -p config-builder -p safety-rules && cd target/release && rm -r build deps incremental
 RUN strip /libra/target/release/config-builder
