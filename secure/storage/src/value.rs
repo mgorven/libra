@@ -7,7 +7,30 @@ use libra_crypto::{
     hash::HashValue,
 };
 use libra_types::transaction::Transaction;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, Deserializer, de};
+use base64;
+
+fn to_base64<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer
+{
+    serializer.serialize_str(&base64::encode(bytes))
+}
+
+fn from_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where D: Deserializer<'de>
+{
+    let s = <&str>::deserialize(deserializer)?;
+    base64::decode(s).map_err(de::Error::custom)
+}
+
+#[derive(Debug, Deserialize, PartialEq, Serialize, Clone, Default)]
+pub struct SafetyData {
+  pub epoch: u64,
+  pub last_voted_round: u64,
+  pub preferred_round: u64,
+  #[serde(serialize_with = "to_base64", deserialize_with = "from_base64")]
+  pub last_vote: Vec<u8>,
+}
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 #[serde(content = "value", rename_all = "snake_case", tag = "type")]
@@ -20,6 +43,7 @@ pub enum Value {
     Transaction(Transaction),
     U64(u64),
     Bytes(Vec<u8>),
+    SafetyData(SafetyData),
 }
 
 impl Value {
@@ -73,6 +97,14 @@ impl Value {
 
     pub fn bytes(self) -> Result<Vec<u8>, Error> {
         if let Value::Bytes(value) = self {
+            Ok(value)
+        } else {
+            Err(Error::UnexpectedValueType)
+        }
+    }
+
+    pub fn safety_data(self) -> Result<SafetyData, Error> {
+        if let Value::SafetyData(value) = self {
             Ok(value)
         } else {
             Err(Error::UnexpectedValueType)

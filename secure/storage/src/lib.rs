@@ -30,6 +30,7 @@ pub use crate::{
     policy::{Capability, Identity, Permission, Policy},
     storage::Storage,
     value::Value,
+    value::SafetyData,
     vault::VaultStorage,
 };
 

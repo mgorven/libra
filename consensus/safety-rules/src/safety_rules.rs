@@ -168,7 +168,7 @@ impl SafetyRules {
     }
 
     /// This verifies the epoch given against storage for consistent verification
-    fn verify_epoch(&self, epoch: u64) -> Result<(), Error> {
+    fn verify_epoch(&mut self, epoch: u64) -> Result<(), Error> {
         let expected_epoch = self.persistent_storage.epoch()?;
         if epoch != expected_epoch {
             Err(Error::IncorrectEpoch(epoch, expected_epoch))
@@ -323,8 +323,6 @@ impl SafetyRules {
             validator_signer,
         );
         self.persistent_storage.set_last_vote(Some(vote.clone()))?;
-        self.persistent_storage
-            .set_last_voted_round(proposed_block.round())?;
 
         Ok(vote)
     }

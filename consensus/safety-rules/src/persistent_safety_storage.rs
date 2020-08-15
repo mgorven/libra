@@ -12,12 +12,11 @@ use consensus_types::{
 };
 use libra_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
 use libra_global_constants::{
-    CONSENSUS_KEY, EPOCH, EXECUTION_KEY, LAST_VOTE, LAST_VOTED_ROUND, OWNER_ACCOUNT,
-    PREFERRED_ROUND, WAYPOINT,
+    CONSENSUS_KEY, EXECUTION_KEY, OWNER_ACCOUNT, WAYPOINT, SAFETY_DATA
 };
 use libra_logger::prelude::*;
 use libra_secure_storage::{
-    CachedStorage, CryptoStorage, InMemoryStorage, KVStorage, Storage, Value,
+    CachedStorage, CryptoStorage, InMemoryStorage, KVStorage, Storage, Value, SafetyData,
 };
 use libra_types::waypoint::Waypoint;
 use std::str::FromStr;
@@ -29,6 +28,8 @@ use std::str::FromStr;
 /// @TODO add retrieval of private key based upon public key to persistent store
 pub struct PersistentSafetyStorage {
     internal_store: Storage,
+    safety_data: SafetyData,
+    safety_data_valid: bool,
 }
 
 impl PersistentSafetyStorage {
@@ -63,7 +64,8 @@ impl PersistentSafetyStorage {
             waypoint,
         )
         .expect("Unable to initialize backend storage");
-        Self { internal_store }
+        let safety_data = SafetyData::default();
+        Self { internal_store, safety_data, safety_data_valid: false }
     }
 
     fn initialize_(
@@ -85,27 +87,25 @@ impl PersistentSafetyStorage {
         }
 
         internal_store.import_private_key(EXECUTION_KEY, execution_private_key)?;
-        internal_store.set(EPOCH, Value::U64(1))?;
-        internal_store.set(LAST_VOTED_ROUND, Value::U64(0))?;
         internal_store.set(OWNER_ACCOUNT, Value::String(author.to_string()))?;
-        internal_store.set(PREFERRED_ROUND, Value::U64(0))?;
         internal_store.set(WAYPOINT, Value::String(waypoint.to_string()))?;
-        internal_store.set(
-            LAST_VOTE,
-            Value::Bytes(lcs::to_bytes::<Option<Vote>>(&None)?),
-        )?;
         Ok(())
     }
 
     pub fn into_cached(self) -> PersistentSafetyStorage {
+        let safety_data = SafetyData::default();
         // will be an idempotent operation if the underlying storage is already a CachedStorage
         if let Storage::CachedStorage(cached_storage) = self.internal_store {
             PersistentSafetyStorage {
                 internal_store: Storage::CachedStorage(cached_storage),
+                safety_data,
+                safety_data_valid: false,
             }
         } else {
             PersistentSafetyStorage {
                 internal_store: Storage::CachedStorage(CachedStorage::new(self.internal_store)),
+                safety_data,
+                safety_data_valid: false,
             }
         }
     }
@@ -113,7 +113,8 @@ impl PersistentSafetyStorage {
     /// Use this to instantiate a PersistentStorage with an existing data store. This is intended
     /// for constructed environments.
     pub fn new(internal_store: Storage) -> Self {
-        Self { internal_store }
+        let safety_data = SafetyData::default();
+        Self { internal_store, safety_data, safety_data_valid: false }
     }
 
     pub fn author(&self) -> Result<Author> {
@@ -138,12 +139,16 @@ impl PersistentSafetyStorage {
             .map(|r| r.public_key)?)
     }
 
-    pub fn epoch(&self) -> Result<u64> {
-        Ok(self.internal_store.get(EPOCH).and_then(|r| r.value.u64())?)
+    pub fn epoch(&mut self) -> Result<u64> {
+        if ! self.safety_data_valid {
+          self.safety_data = self.internal_store.get(SAFETY_DATA).and_then(|r| r.value.safety_data())?;
+          self.safety_data_valid = true;
+        }
+        Ok(self.safety_data.epoch)
     }
 
     pub fn set_epoch(&mut self, epoch: u64) -> Result<()> {
-        self.internal_store.set(EPOCH, Value::U64(epoch))?;
+        self.safety_data.epoch = epoch;
         counters::set_state("epoch", epoch as i64);
         send_struct_log!(logging::safety_log(LogEntry::Epoch, LogEvent::Update)
             .data(LogField::Message.as_str(), epoch));
@@ -151,31 +156,24 @@ impl PersistentSafetyStorage {
     }
 
     pub fn last_vote(&self) -> Result<Option<Vote>> {
-        let result = lcs::from_bytes(
-            &self
-                .internal_store
-                .get(LAST_VOTE)
-                .and_then(|r| r.value.bytes())?,
-        )?;
-        Ok(result)
+        Ok(lcs::from_bytes(&self.safety_data.last_vote)?)
     }
 
     pub fn set_last_vote(&mut self, vote: Option<Vote>) -> Result<()> {
+        self.safety_data.last_vote = lcs::to_bytes(&vote)?;
+        self.safety_data_valid = false;
         self.internal_store
-            .set(LAST_VOTE, Value::Bytes(lcs::to_bytes(&vote)?))?;
+            .set(SAFETY_DATA, Value::SafetyData(SafetyData::clone(&self.safety_data)))?;
+        self.safety_data_valid = true;
         Ok(())
     }
 
     pub fn last_voted_round(&self) -> Result<Round> {
-        Ok(self
-            .internal_store
-            .get(LAST_VOTED_ROUND)
-            .and_then(|r| r.value.u64())?)
+        Ok(self.safety_data.last_voted_round)
     }
 
     pub fn set_last_voted_round(&mut self, last_voted_round: Round) -> Result<()> {
-        self.internal_store
-            .set(LAST_VOTED_ROUND, Value::U64(last_voted_round))?;
+        self.safety_data.last_voted_round = last_voted_round;
         counters::set_state("last_voted_round", last_voted_round as i64);
         send_struct_log!(
             logging::safety_log(LogEntry::LastVotedRound, LogEvent::Update)
@@ -185,15 +183,11 @@ impl PersistentSafetyStorage {
     }
 
     pub fn preferred_round(&self) -> Result<Round> {
-        Ok(self
-            .internal_store
-            .get(PREFERRED_ROUND)
-            .and_then(|r| r.value.u64())?)
+        Ok(self.safety_data.preferred_round)
     }
 
     pub fn set_preferred_round(&mut self, preferred_round: Round) -> Result<()> {
-        self.internal_store
-            .set(PREFERRED_ROUND, Value::U64(preferred_round))?;
+        self.safety_data.preferred_round = preferred_round;
         counters::set_state("preferred_round", preferred_round as i64);
         send_struct_log!(
             logging::safety_log(LogEntry::PreferredRound, LogEvent::Update)

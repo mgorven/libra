@@ -14,6 +14,7 @@ use libra_secure_time::{RealTimeService, TimeService};
 use libra_vault_client::{self as vault, Client};
 use serde::ser::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{collections::HashMap, sync::RwLock};
 
 const LIBRA_DEFAULT: &str = "libra_default";
 
@@ -29,6 +30,7 @@ pub struct VaultStorage {
     namespace: Option<String>,
     renew_ttl_secs: Option<u32>,
     next_renewal: AtomicU64,
+    versions: RwLock<HashMap<String, u32>>,
 }
 
 impl VaultStorage {
@@ -44,6 +46,7 @@ impl VaultStorage {
             namespace,
             renew_ttl_secs,
             next_renewal: AtomicU64::new(0),
+            versions: RwLock::new(HashMap::new()),
         }
     }
 
@@ -224,13 +227,19 @@ impl KVStorage for VaultStorage {
         let resp = self.client().read_secret(&secret, key)?;
         let last_update = DateTime::parse_from_rfc3339(&resp.creation_time)?.timestamp() as u64;
         let value: Value = serde_json::from_str(&resp.value)?;
+        self.versions.write().unwrap().insert(key.to_string(), resp.version);
         Ok(GetResponse { last_update, value })
     }
 
     fn set(&mut self, key: &str, value: Value) -> Result<(), Error> {
         let secret = self.secret_name(key);
-        self.client()
-            .write_secret(&secret, key, &serde_json::to_string(&value)?)?;
+        let version = match self.versions.read().unwrap().get(&key.to_string()) {
+          Some(version) => Some(*version),
+          None => None,
+        };
+        let new_version = self.client()
+            .write_secret(&secret, key, &serde_json::to_string(&value)?, version)?;
+        self.versions.write().unwrap().insert(key.to_string(), new_version);
         Ok(())
     }
 

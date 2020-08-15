@@ -58,6 +58,10 @@ impl<S: KVStorage> KVStorage for CachedStorage<S> {
                         Value::Bytes(value.clone()),
                         self.time_service.now(),
                     )),
+                    Value::SafetyData(value) => Ok(GetResponse::new(
+                        Value::SafetyData(value.clone()),
+                        self.time_service.now(),
+                    )),
                 };
             }
         }
@@ -111,6 +115,13 @@ impl<S: KVStorage> KVStorage for CachedStorage<S> {
                         .insert(key.to_string(), Value::Bytes(value.clone()));
                     Ok(GetResponse::new(Value::Bytes(value), last_update))
                 }
+                Value::SafetyData(value) => {
+                    self.cache
+                        .write()
+                        .unwrap()
+                        .insert(key.to_string(), Value::SafetyData(value.clone()));
+                    Ok(GetResponse::new(Value::SafetyData(value), last_update))
+                }
             },
         }
     }
@@ -161,6 +172,14 @@ impl<S: KVStorage> KVStorage for CachedStorage<S> {
                     .write()
                     .unwrap()
                     .insert(key.to_string(), Value::Bytes(value));
+                Ok(())
+            }
+            Value::SafetyData(value) => {
+                self.storage.set(key, Value::SafetyData(value.clone()))?;
+                self.cache
+                    .write()
+                    .unwrap()
+                    .insert(key.to_string(), Value::SafetyData(value));
                 Ok(())
             }
         }

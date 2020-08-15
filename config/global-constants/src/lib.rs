@@ -25,3 +25,4 @@ pub const LAST_VOTED_ROUND: &str = "last_voted_round";
 pub const PREFERRED_ROUND: &str = "preferred_round";
 pub const WAYPOINT: &str = "waypoint";
 pub const LAST_VOTE: &str = "last_vote";
+pub const SAFETY_DATA: &str = "safety_data";

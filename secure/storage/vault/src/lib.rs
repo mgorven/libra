@@ -468,18 +468,24 @@ impl Client {
     }
 
     /// Create or update a key/value pair in a given secret store.
-    pub fn write_secret(&self, secret: &str, key: &str, value: &str) -> Result<(), Error> {
+    pub fn write_secret(&self, secret: &str, key: &str, value: &str, version: Option<u32>) -> Result<u32, Error> {
+        let payload = if let Some(version) = version {
+          json!({ "data": { key: value }, "options": {"cas": version} })
+        } else {
+          println!("vault: Writing secret {} without CAS", secret);
+          json!({ "data": { key: value } })
+        };
+
         let request = self
             .agent
             .put(&format!("{}/v1/secret/data/{}", self.host, secret));
         let resp = self
             .upgrade_request(request)
-            .send_json(json!({ "data": { key: value } }));
+            .send_json(payload);
 
         if resp.ok() {
-            // Explicitly clear buffer so the stream can be re-used.
-            resp.into_string()?;
-            Ok(())
+            let resp: WriteSecretResponse = serde_json::from_str(&resp.into_string()?)?;
+            Ok(resp.data.version)
         } else {
             Err(resp.into())
         }
@@ -837,6 +843,11 @@ struct ReadSecretData {
 struct ReadSecretMetadata {
     created_time: String,
     version: u32,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+struct WriteSecretResponse {
+    data: ReadSecretMetadata,
 }
 
 /// {
