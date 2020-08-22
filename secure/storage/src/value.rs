@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 #[serde(content = "value", rename_all = "snake_case", tag = "type")]
 #[allow(clippy::large_enum_variant)]
 pub enum Value {
+    Bytes(Vec<u8>),
     Ed25519PrivateKey(Ed25519PrivateKey),
     Ed25519PublicKey(Ed25519PublicKey),
     HashValue(HashValue),
@@ -24,6 +25,14 @@ pub enum Value {
 }
 
 impl Value {
+    pub fn bytes(self) -> Result<Vec<u8>, Error> {
+        if let Value::Bytes(value) = self {
+            Ok(value)
+        } else {
+            Err(Error::UnexpectedValueType)
+        }
+    }
+
     pub fn ed25519_private_key(self) -> Result<Ed25519PrivateKey, Error> {
         if let Value::Ed25519PrivateKey(value) = self {
             Ok(value)

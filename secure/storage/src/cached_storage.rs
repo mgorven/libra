@@ -32,6 +32,10 @@ impl<S: KVStorage> KVStorage for CachedStorage<S> {
             // only acquires a read lock on the cache
             if let Some(value) = self.cache.read().unwrap().get(key) {
                 return match &value {
+                    Value::Bytes(value) => Ok(GetResponse::new(
+                        Value::Bytes(value.clone()),
+                        self.time_service.now(),
+                    )),
                     Value::Ed25519PrivateKey(_) => Err(Error::InternalError(
                         "private keys should not be cached".into(),
                     )),
@@ -40,6 +44,10 @@ impl<S: KVStorage> KVStorage for CachedStorage<S> {
                     )),
                     Value::HashValue(value) => Ok(GetResponse::new(
                         Value::HashValue(*value),
+                        self.time_service.now(),
+                    )),
+                    Value::SafetyData(value) => Ok(GetResponse::new(
+                        Value::SafetyData(value.clone()),
                         self.time_service.now(),
                     )),
                     Value::String(value) => Ok(GetResponse::new(
@@ -54,10 +62,6 @@ impl<S: KVStorage> KVStorage for CachedStorage<S> {
                         Value::U64(*value),
                         self.time_service.now(),
                     )),
-                    Value::SafetyData(value) => Ok(GetResponse::new(
-                        Value::SafetyData(value.clone()),
-                        self.time_service.now(),
-                    )),
                 };
             }
         }
@@ -66,6 +70,13 @@ impl<S: KVStorage> KVStorage for CachedStorage<S> {
         match self.storage.get(key) {
             Err(err) => Err(err),
             Ok(GetResponse { last_update, value }) => match value {
+                Value::Bytes(value) => {
+                    self.cache
+                        .write()
+                        .unwrap()
+                        .insert(key.to_string(), Value::Bytes(value.clone()));
+                    Ok(GetResponse::new(Value::Bytes(value), last_update))
+                }
                 // private keys are not cached
                 Value::Ed25519PrivateKey(value) => Ok(GetResponse::new(
                     Value::Ed25519PrivateKey(value),
@@ -117,6 +128,14 @@ impl<S: KVStorage> KVStorage for CachedStorage<S> {
 
     fn set(&mut self, key: &str, value: Value) -> Result<(), Error> {
         match value {
+            Value::Bytes(value) => {
+                self.storage.set(key, Value::Bytes(value.clone()))?;
+                self.cache
+                    .write()
+                    .unwrap()
+                    .insert(key.to_string(), Value::Bytes(value));
+                Ok(())
+            }
             // private keys are not cached
             Value::Ed25519PrivateKey(value) => {
                 self.storage.set(key, Value::Ed25519PrivateKey(value))

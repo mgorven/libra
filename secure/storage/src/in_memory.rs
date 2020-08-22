@@ -46,6 +46,7 @@ impl<T: Send + Sync + TimeService> KVStorage for InMemoryStorageInternal<T> {
             .ok_or_else(|| Error::KeyNotSet(key.to_string()))?;
 
         let value = match &response.value {
+            Value::Bytes(value) => Value::Bytes(value.clone()),
             Value::Ed25519PrivateKey(value) => {
                 // Hack because Ed25519PrivateKey does not support clone / copy
                 let bytes = lcs::to_bytes(&value)?;
