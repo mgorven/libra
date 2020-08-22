@@ -8,12 +8,27 @@ use libra_crypto::{
     hash::HashValue,
 };
 use libra_types::transaction::Transaction;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, Deserializer, de};
+use base64;
+
+fn to_base64<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer
+{
+    serializer.serialize_str(&base64::encode(bytes))
+}
+
+fn from_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where D: Deserializer<'de>
+{
+    let s = String::deserialize(deserializer)?;
+    base64::decode(s).map_err(de::Error::custom)
+}
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
 pub enum Value {
+    #[serde(serialize_with = "to_base64", deserialize_with = "from_base64")]
     Bytes(Vec<u8>),
     Ed25519PrivateKey(Ed25519PrivateKey),
     Ed25519PublicKey(Ed25519PublicKey),
