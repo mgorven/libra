@@ -25,6 +25,7 @@ use libra_types::{
     },
     vm_status::KeptVMStatus,
 };
+use state_synchronizer::StateSyncClient;
 use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
@@ -39,6 +40,7 @@ pub fn test_bootstrap(
     address: SocketAddr,
     libra_db: Arc<dyn DbReader>,
     mp_sender: MempoolClientSender,
+    state_sync: Arc<StateSyncClient>,
 ) -> Runtime {
     crate::bootstrap(
         address,
@@ -47,6 +49,7 @@ pub fn test_bootstrap(
         DEFAULT_CONTENT_LENGTH_LIMIT,
         libra_db,
         mp_sender,
+        state_sync,
         RoleType::Validator,
         ChainId::test(),
     )

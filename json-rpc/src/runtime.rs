@@ -14,11 +14,12 @@ use libra_mempool::MempoolClientSender;
 use libra_types::{chain_id::ChainId, ledger_info::LedgerInfoWithSignatures};
 use rand::{rngs::OsRng, RngCore};
 use serde_json::{map::Map, Value};
+use state_synchronizer::StateSyncClient;
 use std::{net::SocketAddr, sync::Arc};
 use storage_interface::DbReader;
 use tokio::runtime::{Builder, Runtime};
 use warp::{
-    http::header,
+    http::{header, StatusCode},
     reject::{self, Reject},
     Filter,
 };
@@ -57,6 +58,11 @@ struct RpcResponseLog<'a> {
     response: &'a JsonRpcResponse,
 }
 
+#[derive(serde_derive::Deserialize, Debug, Eq, PartialEq)]
+struct HealthCheckArgs {
+    max_lag: Option<u64>,
+}
+
 #[macro_export]
 macro_rules! log_response {
     ($trace_id: expr, $resp: expr, $is_batch: expr) => {
@@ -87,6 +93,7 @@ pub fn bootstrap(
     content_len_limit: usize,
     libra_db: Arc<dyn DbReader>,
     mp_sender: MempoolClientSender,
+    state_sync: Arc<StateSyncClient>,
     role: RoleType,
     chain_id: ChainId,
 ) -> Runtime {
@@ -99,7 +106,7 @@ pub fn bootstrap(
 
     let registry = Arc::new(build_registry());
     let service = JsonRpcService::new(
-        libra_db,
+        Arc::clone(&libra_db),
         mp_sender,
         role,
         chain_id,
@@ -141,7 +148,10 @@ pub fn bootstrap(
 
     let health_route = warp::path!("-" / "healthy")
         .and(warp::path::end())
-        .map(|| "libra-node:ok");
+        .and(warp::any().map(move || Arc::clone(&libra_db)))
+        .and(warp::any().map(move || Arc::clone(&state_sync)))
+        .and(warp::query().map(|args: HealthCheckArgs| args))
+        .and_then(health_endpoint);
 
     let full_route = health_route.or(route_v1.or(route_root));
 
@@ -163,6 +173,7 @@ pub fn bootstrap_from_config(
     chain_id: ChainId,
     libra_db: Arc<dyn DbReader>,
     mp_sender: MempoolClientSender,
+    state_sync: Arc<StateSyncClient>,
 ) -> Runtime {
     bootstrap(
         config.json_rpc.address,
@@ -171,6 +182,7 @@ pub fn bootstrap_from_config(
         config.json_rpc.content_length_limit,
         libra_db,
         mp_sender,
+        state_sync,
         config.base.role,
         chain_id,
     )
@@ -427,6 +439,37 @@ fn verify_protocol(request: &Map<String, Value>) -> Result<(), JsonRpcError> {
         }
     }
     Err(JsonRpcError::invalid_request())
+}
+
+async fn health_endpoint(
+    libra_db: Arc<dyn DbReader>,
+    state_sync: Arc<StateSyncClient>,
+    args: HealthCheckArgs,
+) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
+    let (msg, code) = match args.max_lag {
+        None => ("libra-node:ok".to_string(), StatusCode::OK),
+        Some(max_lag) => {
+            let committed = libra_db
+                .get_latest_ledger_info()
+                .map_err(|_| reject::custom(DatabaseError))?;
+            let latest = state_sync
+                .get_state()
+                .await
+                .map_err(|_| reject::custom(DatabaseError))?;
+            let lag = (latest.highest_local_li.ledger_info().timestamp_usecs()
+                - committed.ledger_info().timestamp_usecs())
+                / 1000000;
+            (
+                format!("libra-node:lag={}", lag),
+                if lag < max_lag {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+            )
+        }
+    };
+    Ok(Box::new(warp::reply::with_status(msg, code)))
 }
 
 /// Warp rejection types
