@@ -7,3 +7,14 @@ xfix = "run --package x --bin x -- fix"
 xtest = "run --package x --bin x -- test"
 xlint = "run --package x --bin x -- lint"
 xbuild = "run --package x --bin x -- build"
+
+[build]
+
+[target.arm-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-none-linux-gnueabihf-gcc"
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-none-linux-gnu-gcc"
